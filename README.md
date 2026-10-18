@@ -21,16 +21,19 @@ Most student BMS projects stop at voltage and temperature. CellSight goes to the
 3. Calibration against a precision resistor yields the system gain factor and phase offset
 4. Firmware reconstructs Z′/Z″, draws the **Nyquist plot** on the web dashboard, and grades SOH
 5. A **DCIR pulse test** (MOSFET-switched known load) and DS18B20 temperature complete the picture
+6. Each sweep point is measured **3× and averaged** (circular phase mean), impedance is **temperature-compensated** to the 25 °C reference, and the full spectrum can be **exported as CSV** from the dashboard
 
-## 📂 In this repo
+## 📂 In this repo (multi-file firmware)
 
-- `CellSight_EIS.ino` — complete firmware (AD5933 driver, sweep engine, Nyquist analysis, SOH grading, dashboard)
+- `CellSight_EIS.ino` — main sketch: dashboard, DCIR test, OCV/temperature, CSV export endpoint
+- `ad5933.h` — complete AD5933 impedance-converter driver
+- `eis.h` — sweep engine, calibration, per-point averaging, temperature compensation, Nyquist analysis + SOH grading
 - `components.md` — component list with the role of each part
 - `nyquist-explained.md` — how to read a Nyquist plot and judge a cell from it
 
 ## 🖥️ Dashboard
 
-Dark web dashboard served by the ESP32: SOH gauge with grade, OCV, R_ohmic, R_ct, DCIR, cell temperature, a live **Nyquist plot canvas**, the full spectrum table, and buttons to run a sweep / calibration / DCIR test.
+Dark web dashboard served by the ESP32: SOH gauge with grade, OCV, R_ohmic, R_ct, DCIR, cell temperature, a live **Nyquist plot canvas**, the full spectrum table, buttons to run a sweep / calibration / DCIR test, and a **Download CSV** export of the last sweep.
 
 ## ⚠️ Safety
 
