@@ -1,5 +1,5 @@
 // ============================================================
-//  CELLSIGHT - EIS BATTERY HEALTH ANALYZER
+//  CELLSIGHT - EIS BATTERY HEALTH ANALYZER (v2, multi-file)
 //  ESP32 + AD5933 Impedance Converter + DS18B20
 // ------------------------------------------------------------
 //  Electrochemical Impedance Spectroscopy (EIS) is how battery
@@ -29,7 +29,37 @@
 //      of the cell before first use (dashboard button / serial
 //      command 'c').
 //
-//  Author : Deepesh Chauhan, B.Tech Electrical Engineering
+//  PROJECT STRUCTURE (v2)
+//    v1 of CellSight was a single 531-line sketch. v2 keeps
+//    every v1 feature and contract, but splits the code into
+//    focused modules so each layer can be read, tested and
+//    reused on its own. The folder compiles as ONE Arduino
+//    sketch - open this .ino and the IDE pulls in both headers:
+//
+//      CellSight_EIS.ino (this file)
+//        Owns the hardware and the application: pin map, cell
+//        temperature (DS18B20), OCV + DCIR DC measurements,
+//        the event log, and the web server with its dashboard
+//        and the /, /data, /cmd and /csv endpoints.
+//      ad5933.h
+//        Register-level driver for the AD5933 impedance
+//        converter: I2C primitives, frequency programming,
+//        control commands and raw DFT readout.
+//      eis.h
+//        The measurement engine: calibration, the averaged
+//        and temperature-compensated frequency sweep, Nyquist
+//        feature extraction and SOH grading. It calls back
+//        into this sketch only through logEvent(),
+//        serviceClients() and the shared cellTempC value.
+//
+//    New in v2: per-point averaging (3 conversions per
+//    frequency) with a per-point repeatability (spread)
+//    figure, temperature compensation of the spectrum to
+//    the 25 degC reference, CSV export of the last sweep
+//    from the dashboard (GET /csv), and the same CSV as a
+//    serial report for offline bench work.
+//
+//  Author : Deepesh Chauhan, B.Tech Electrical Engineering,
 //           RGGEC Kangra
 // ============================================================
 
@@ -39,52 +69,12 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <math.h>
+#include "ad5933.h"      // AD5933 register-level driver
+#include "eis.h"         // calibration, sweep engine, analysis
 
 // ---------------- WI-FI (replace with your credentials) ------
 const char* WIFI_SSID = "YOUR_WIFI_NAME";
 const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
-
-// ---------------- AD5933 REGISTERS ---------------------------
-#define AD5933_ADDR        0x0D
-#define REG_CTRL_H         0x80
-#define REG_CTRL_L         0x81
-#define REG_FREQ_START_H   0x82
-#define REG_FREQ_INC_H     0x85
-#define REG_NUM_INC_H      0x88
-#define REG_SETTLE_H       0x8A
-#define REG_STATUS         0x8F
-#define REG_TEMP_H         0x92
-#define REG_REAL_H         0x94
-#define REG_IMAG_H         0x96
-
-#define CTRL_INIT          0x10   // init with start frequency
-#define CTRL_START_SWEEP   0x20
-#define CTRL_INC_FREQ      0x30
-#define CTRL_REPEAT_FREQ   0x40
-#define CTRL_POWER_DOWN    0xA0
-#define CTRL_STANDBY       0xB0
-#define CTRL_RESET         0x10   // in CTRL_L bit 4
-
-#define STATUS_TEMP_VALID  0x01
-#define STATUS_DATA_VALID  0x02
-#define STATUS_SWEEP_DONE  0x04
-
-// ---------------- SWEEP CONFIG -------------------------------
-const float SWEEP_START_HZ = 10000.0f;   // start high...
-const float SWEEP_END_HZ   = 10.0f;      // ...sweep down in analysis
-const int   SWEEP_POINTS   = 40;         // log-spaced points
-const int   SETTLE_CYCLES  = 15;
-
-// Calibration resistor (ohms) placed at the cell position
-// during calibration. The AFE gain is folded into the gain
-// factor computed from this known resistor.
-const float CAL_RES_OHMS   = 10.0f;
-
-// Fresh-cell baseline (measure once on a new cell, then store).
-// These defaults are for a typical 18650 Li-ion cell measured
-// through the reference AFE - replace with your own baseline.
-float baseline_R_ohmic = 0.045f;         // ohms
-float baseline_R_ct    = 0.060f;         // ohms
 
 // ---------------- PINS --------------------------------------
 #define TEMP_PIN     4                   // DS18B20 data
@@ -94,26 +84,13 @@ float baseline_R_ct    = 0.060f;         // ohms
 // Cell voltage divider: cell (max 4.2V) -> 2:1 divider -> ADC
 const float CELL_DIV_RATIO = 2.0f;
 
-// ---------------- EIS RESULT STORAGE --------------------------
-struct EisPoint {
-  float freq;        // Hz
-  float zReal;       // ohms (Z')
-  float zImag;       // ohms (Z'', negative for capacitive)
-  float zMag;
-  float phaseDeg;
-};
-EisPoint sweep[SWEEP_POINTS];
-int   sweepCount   = 0;
-bool  sweepRunning = false;
-bool  sweepDone    = false;
-double gainFactor  = 0.0;       // from calibration
-float systemPhase  = 0.0f;      // degrees, from calibration
-
-float rOhmic = 0, rCt = 0, warburgSlope = 0;
-float sohPercent = 0;
-String sohGrade = "NOT MEASURED";
-float cellOCV = 0, cellTempC = 25.0f, dcir = 0;
-String eventLog = "Boot\n";
+// ---------------- SKETCH-OWNED STATE --------------------------
+// cellTempC is declared extern in eis.h: the sweep engine reads
+// it for temperature compensation and snapshots it per sweep.
+float cellTempC = 25.0f;                 // DS18B20 cell temperature
+float cellOCV   = 0;                     // last open-circuit voltage
+float dcir      = 0;                     // last DCIR result, ohms
+String eventLog = "Boot\n";              // dashboard / serial log
 
 // ---------------- OBJECTS -------------------------------------
 OneWire oneWire(TEMP_PIN);
@@ -121,205 +98,26 @@ DallasTemperature tempSensor(&oneWire);
 WebServer server(80);
 
 // =============================================================
-//  AD5933 LOW-LEVEL DRIVER
+//  LOGGING + WEB PUMP (services consumed by eis.h)
 // =============================================================
-void adWrite(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(AD5933_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
+void logEvent(const String& msg) {
+  eventLog += msg + "\n";
+  if (eventLog.length() > 1600) eventLog = eventLog.substring(500);
+  Serial.println(msg);
 }
 
-uint8_t adRead(uint8_t reg) {
-  // Pointer command (0xB0) sets the register address
-  Wire.beginTransmission(AD5933_ADDR);
-  Wire.write(0xB0);
-  Wire.write(reg);
-  Wire.endTransmission();
-  Wire.requestFrom(AD5933_ADDR, 1);
-  return Wire.available() ? Wire.read() : 0;
-}
-
-int16_t adReadWord(uint8_t regH) {
-  uint8_t hi = adRead(regH);
-  uint8_t lo = adRead(regH + 1);
-  return (int16_t)((hi << 8) | lo);
-}
-
-void adSetFrequency(uint8_t regBase, float freqHz) {
-  // freq register = (freq / (MCLK/4)) * 2^27, MCLK = 16.776 MHz
-  uint32_t code = (uint32_t)((freqHz / (16776000.0 / 4.0)) * 134217728.0);
-  adWrite(regBase,     (code >> 16) & 0xFF);
-  adWrite(regBase + 1, (code >> 8)  & 0xFF);
-  adWrite(regBase + 2,  code        & 0xFF);
-}
-
-void adControl(uint8_t cmd) {
-  uint8_t l = adRead(REG_CTRL_L);
-  adWrite(REG_CTRL_H, cmd | 0x01);        // range 1, PGA x1
-  adWrite(REG_CTRL_L, l);
-}
-
-// Measure ONE frequency point; returns magnitude & phase(deg)
-// of the transfer function reported by the AD5933 DFT engine.
-bool adMeasure(float& magnitude, float& phaseDeg) {
-  unsigned long t0 = millis();
-  while (!(adRead(REG_STATUS) & STATUS_DATA_VALID)) {
-    if (millis() - t0 > 2000) return false;   // timeout
-    delay(2);
-  }
-  int16_t re = adReadWord(REG_REAL_H);
-  int16_t im = adReadWord(REG_IMAG_H);
-  magnitude = sqrt((double)re * re + (double)im * im);
-  phaseDeg  = atan2((double)im, (double)re) * 180.0 / PI;
-  return true;
-}
-
-// =============================================================
-//  CALIBRATION
-//  With CAL_RES in place of the cell, gain factor relates the
-//  measured DFT magnitude to true impedance:
-//      |Z| = 1 / (GF * magnitude)
-// =============================================================
-bool runCalibration() {
-  adWrite(REG_CTRL_L, CTRL_RESET);
-  delay(5);
-  adSetFrequency(REG_FREQ_START_H, 1000.0f);
-  adSetFrequency(REG_FREQ_INC_H, 0.0f);
-  adWrite(REG_NUM_INC_H, 0); adWrite(REG_NUM_INC_H + 1, 0);
-  adWrite(REG_SETTLE_H, 0);  adWrite(REG_SETTLE_H + 1, SETTLE_CYCLES);
-  adControl(CTRL_STANDBY);
-  adControl(CTRL_INIT);
-  delay(10);
-  adControl(CTRL_START_SWEEP);
-  float mag, ph;
-  if (!adMeasure(mag, ph) || mag == 0) return false;
-  gainFactor  = 1.0 / (CAL_RES_OHMS * mag);
-  systemPhase = ph;
-  adControl(CTRL_POWER_DOWN);
-  logEvent("Calibration OK. GF=" + String(gainFactor, 6));
-  return true;
-}
-
-// =============================================================
-//  FULL EIS SWEEP  (log-spaced, high -> low frequency)
-// =============================================================
-void runSweep() {
-  sweepRunning = true;
-  sweepDone = false;
-  sweepCount = 0;
-
-  // Log-spaced frequency table
-  float freqs[SWEEP_POINTS];
-  float ratio = pow(SWEEP_END_HZ / SWEEP_START_HZ, 1.0f / (SWEEP_POINTS - 1));
-  for (int i = 0; i < SWEEP_POINTS; i++)
-    freqs[i] = SWEEP_START_HZ * pow(ratio, i);
-
-  for (int i = 0; i < SWEEP_POINTS; i++) {
-    adWrite(REG_CTRL_L, CTRL_RESET);
-    delay(2);
-    adSetFrequency(REG_FREQ_START_H, freqs[i]);
-    adSetFrequency(REG_FREQ_INC_H, 0.0f);
-    adWrite(REG_NUM_INC_H, 0); adWrite(REG_NUM_INC_H + 1, 0);
-    adWrite(REG_SETTLE_H, 0);  adWrite(REG_SETTLE_H + 1, SETTLE_CYCLES);
-    adControl(CTRL_STANDBY);
-    adControl(CTRL_INIT);
-    delay(5);
-    adControl(CTRL_START_SWEEP);
-
-    float mag, ph;
-    if (!adMeasure(mag, ph) || mag == 0) continue;
-
-    double zMag = 1.0 / (gainFactor * mag);
-    double zPhaseRad = (ph - systemPhase) * PI / 180.0;
-
-    EisPoint& p = sweep[sweepCount];
-    p.freq     = freqs[i];
-    p.zMag     = (float)zMag;
-    p.phaseDeg = ph - systemPhase;
-    p.zReal    = (float)(zMag * cos(zPhaseRad));
-    p.zImag    = (float)(zMag * sin(zPhaseRad));
-    sweepCount++;
-
-    server.handleClient();                 // keep UI responsive
-    yield();
-  }
-  adControl(CTRL_POWER_DOWN);
-  sweepRunning = false;
-  sweepDone = true;
-  analyzeSpectrum();
-  logEvent("EIS sweep complete: " + String(sweepCount) + " points");
-}
-
-// =============================================================
-//  NYQUIST ANALYSIS
-//    R_ohmic : Z' at the highest measured frequencies
-//    R_ct    : diameter of the mid-frequency semicircle,
-//              estimated as (Z' at the -Z'' peak) - R_ohmic plus
-//              the low-side crossing; simplified here to
-//              peak-based extraction used for grading.
-//    Warburg : slope of the low-frequency tail in Z' vs
-//              1/sqrt(f) coordinates.
-// =============================================================
-void analyzeSpectrum() {
-  if (sweepCount < 8) return;
-
-  // R_ohmic: average Z' of the 3 highest-frequency points
-  float sum = 0;
-  for (int i = 0; i < 3 && i < sweepCount; i++) sum += sweep[i].zReal;
-  rOhmic = sum / min(3, sweepCount);
-
-  // Semicircle peak: maximum -Z'' in the mid band
-  int peakIdx = -1; float peakVal = 0;
-  for (int i = 0; i < sweepCount; i++) {
-    float neg = -sweep[i].zImag;
-    if (sweep[i].freq < 5000 && sweep[i].freq > 5 && neg > peakVal) {
-      peakVal = neg; peakIdx = i;
-    }
-  }
-  if (peakIdx > 0) {
-    // Diameter approx: Z' where -Z'' falls back near the peak's
-    // half height on the low-frequency side, minus R_ohmic.
-    float lowCross = sweep[peakIdx].zReal;
-    for (int i = peakIdx; i < sweepCount; i++) {
-      if (-sweep[i].zImag < peakVal * 0.5f) { lowCross = sweep[i].zReal; break; }
-      lowCross = sweep[i].zReal;
-    }
-    rCt = max(0.0f, lowCross - rOhmic);
-  }
-
-  // Warburg slope: fit Z' against 1/sqrt(f) on the 5 lowest points
-  int n = min(5, sweepCount);
-  float sx = 0, sy = 0, sxx = 0, sxy = 0;
-  for (int i = sweepCount - n; i < sweepCount; i++) {
-    float x = 1.0f / sqrt(sweep[i].freq);
-    float y = sweep[i].zReal;
-    sx += x; sy += y; sxx += x * x; sxy += x * y;
-  }
-  float denom = n * sxx - sx * sx;
-  warburgSlope = (denom != 0) ? (n * sxy - sx * sy) / denom : 0;
-
-  // ---- SOH grading -------------------------------------------
-  // Ohmic growth dominates end-of-life: a cell whose R_ohmic
-  // has doubled is at ~80% SOH in most grading schemes; we use
-  // a combined score of ohmic growth (60%) + Rct growth (40%).
-  float ohmicScore = 100.0f - 50.0f * max(0.0f, (rOhmic / baseline_R_ohmic) - 1.0f);
-  float ctScore    = 100.0f - 40.0f * max(0.0f, (rCt    / baseline_R_ct)    - 1.0f);
-  sohPercent = constrain(0.6f * ohmicScore + 0.4f * ctScore, 0.0f, 100.0f);
-
-  if      (sohPercent >= 90) sohGrade = "A - EXCELLENT (EV duty)";
-  else if (sohPercent >= 80) sohGrade = "B - GOOD (EV duty)";
-  else if (sohPercent >= 70) sohGrade = "C - SECOND LIFE (storage)";
-  else if (sohPercent >= 60) sohGrade = "D - SECOND LIFE (light duty)";
-  else                       sohGrade = "E - RECYCLE";
-
-  logEvent("R_ohmic=" + String(rOhmic * 1000, 1) + "mOhm R_ct=" +
-           String(rCt * 1000, 1) + "mOhm SOH=" + String(sohPercent, 0) +
-           "% Grade " + sohGrade);
+// eis.h calls this inside the sweep loop: a full sweep can take
+// minutes at the low-frequency end, and the web server must
+// keep answering the dashboard meanwhile.
+void serviceClients() {
+  server.handleClient();
 }
 
 // =============================================================
 //  DC MEASUREMENTS - OCV + DCIR LOAD PULSE
+//  The AC (EIS) picture is cross-checked with two DC tests:
+//  the rested open-circuit voltage, and the voltage sag under
+//  a known 1-second load pulse (DC internal resistance).
 // =============================================================
 float readCellVoltage() {
   int raw = analogRead(CELL_ADC_PIN);
@@ -341,16 +139,10 @@ void runDcirTest() {
 }
 
 // =============================================================
-//  LOGGING
-// =============================================================
-void logEvent(const String& msg) {
-  eventLog += msg + "\n";
-  if (eventLog.length() > 1600) eventLog = eventLog.substring(500);
-  Serial.println(msg);
-}
-
-// =============================================================
-//  DASHBOARD  (Nyquist plot + SOH + spectrum table)
+//  DASHBOARD  (Nyquist plot + SOH + spectrum table + CSV)
+//  Single self-contained page served from flash. It polls
+//  /data every 2 s for the JSON state, fires actions at /cmd,
+//  and downloads the last sweep from /csv.
 // =============================================================
 const char DASHBOARD[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8">
@@ -387,6 +179,7 @@ const char DASHBOARD[] PROGMEM = R"HTML(
  <button onclick="cmd('sweep')">▶ Run EIS Sweep</button>
  <button onclick="cmd('cal')">Calibrate (CAL resistor fitted)</button>
  <button onclick="cmd('dcir')">DCIR Pulse Test</button>
+ <button onclick="location.href='/csv'">⬇ Download CSV</button>
 </p>
 <h3>Nyquist Plot (−Z″ vs Z′)</h3>
 <canvas id="nyq" width="940" height="380"></canvas>
@@ -432,8 +225,23 @@ async function tick(){
 setInterval(tick,2000);tick();
 </script></div></body></html>)HTML";
 
+// =============================================================
+//  HTTP ENDPOINT REFERENCE
+//    GET /            this dashboard (single-page UI)
+//    GET /data        JSON state: SOH/grade, OCV, R_ohmic,
+//                     R_ct, DCIR, cell temp, event log, and
+//                     the spectrum as plot points + table rows
+//    GET /cmd?c=...   actions: cal | sweep | dcir (see below)
+//    GET /csv         last sweep as a CSV file download,
+//                     25 degC-compensated values (see below)
+// =============================================================
 void handleRoot() { server.send_P(200, "text/html", DASHBOARD); }
 
+// =============================================================
+//  /data - JSON state for the dashboard (contract as v1).
+//  Impedance values are the temperature-compensated spectrum
+//  stored by eis.h; the dashboard works in milliohms.
+// =============================================================
 void handleData() {
   String j = "{";
   j += "\"soh\":" + String(sohPercent, 1);
@@ -466,6 +274,68 @@ void handleData() {
   server.send(200, "application/json", j);
 }
 
+// =============================================================
+//  /csv - stream the last sweep as a CSV download (new in v2).
+//  One row per frequency point. The impedance columns are the
+//  25 degC-compensated values in milliohms; z_imag_mohm is the
+//  signed imaginary part (negative = capacitive, as stored).
+//  cell_temp_c is the temperature the sweep was corrected
+//  from, and timestamp_ms is the device uptime (millis) at
+//  sweep completion - both are properties of the sweep, so
+//  they repeat on every row. With no sweep yet, the response
+//  is just the header row. The body is streamed in chunks
+//  (unknown content length) rather than buffered whole.
+// =============================================================
+void handleCsv() {
+  server.sendHeader("Content-Disposition",
+                    "attachment; filename=\"cellsight_sweep.csv\"");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent(
+      "freq_hz,z_mag_mohm,z_real_mohm,z_imag_mohm,phase_deg,"
+      "cell_temp_c,timestamp_ms\n");
+  for (int i = 0; i < sweepCount; i++) {
+    const EisPoint& p = sweep[i];
+    String line;
+    line += String(p.freq, 1);         line += ",";
+    line += String(p.zMag * 1000, 2);  line += ",";
+    line += String(p.zReal * 1000, 2); line += ",";
+    line += String(p.zImag * 1000, 2); line += ",";
+    line += String(p.phaseDeg, 2);     line += ",";
+    line += String(sweepTempC, 1);     line += ",";
+    line += String(sweepTimestampMs);  line += "\n";
+    server.sendContent(line);
+  }
+  server.sendContent("");                // terminate chunked body
+}
+
+// =============================================================
+//  SERIAL SWEEP REPORT (new in v2)
+//  Dumps the last sweep to the serial console in the same CSV
+//  layout as /csv, so a bench session without Wi-Fi can still
+//  capture the spectrum into any serial terminal and save it
+//  straight into a spreadsheet or an EIS fitting tool.
+// =============================================================
+void printSweepSerial() {
+  Serial.println("freq_hz,z_mag_mohm,z_real_mohm,z_imag_mohm,"
+                 "phase_deg,spread_pct,cell_temp_c,timestamp_ms");
+  for (int i = 0; i < sweepCount; i++) {
+    const EisPoint& p = sweep[i];
+    Serial.print(String(p.freq, 1));         Serial.print(",");
+    Serial.print(String(p.zMag * 1000, 2));  Serial.print(",");
+    Serial.print(String(p.zReal * 1000, 2)); Serial.print(",");
+    Serial.print(String(p.zImag * 1000, 2)); Serial.print(",");
+    Serial.print(String(p.phaseDeg, 2));     Serial.print(",");
+    Serial.print(String(p.spreadPct, 2));    Serial.print(",");
+    Serial.print(String(sweepTempC, 1));     Serial.print(",");
+    Serial.println(String(sweepTimestampMs));
+  }
+}
+
+// =============================================================
+//  /cmd - dashboard actions (contract as v1):
+//    c=cal -> calibration, c=sweep -> EIS sweep, c=dcir -> DCIR
+// =============================================================
 void handleCmd() {
   String c = server.arg("c");
   if (c == "cal") {
@@ -475,6 +345,7 @@ void handleCmd() {
     server.send(200, "text/plain", "sweep started");
     if (gainFactor == 0) logEvent("WARNING: not calibrated - results indicative only");
     runSweep();
+    printSweepSerial();
   } else if (c == "dcir") {
     server.send(200, "text/plain", "dcir done");
     runDcirTest();
@@ -486,7 +357,17 @@ void handleCmd() {
 // =============================================================
 void setup() {
   Serial.begin(115200);
+  Serial.println();
+  Serial.println("CellSight EIS Battery Health Analyzer v2 (multi-file)");
+  Serial.println("ESP32 + AD5933 + DS18B20 - averaged, temperature-"
+                 "compensated EIS with SOH grading");
   Wire.begin(21, 22);
+  if (adSelfTest()) {
+    logEvent("AD5933 self-test passed (register readback OK).");
+  } else {
+    logEvent("WARNING: AD5933 not responding - check I2C wiring/pull-ups "
+             "before trusting any measurement.");
+  }
   tempSensor.begin();
   pinMode(LOAD_PIN, OUTPUT);
   digitalWrite(LOAD_PIN, LOW);
@@ -499,10 +380,11 @@ void setup() {
     server.on("/", handleRoot);
     server.on("/data", handleData);
     server.on("/cmd", handleCmd);
+    server.on("/csv", handleCsv);
     server.begin();
     logEvent("Dashboard: http://" + WiFi.localIP().toString());
   } else {
-    logEvent("Wi-Fi offline - serial mode. Commands: c=calibrate s=sweep d=dcir");
+    logEvent("Wi-Fi offline - serial mode. Commands: c=calibrate s=sweep d=dcir p=print sweep");
   }
 
   if (runCalibration()) logEvent("Auto-calibration done (CAL path).");
@@ -513,6 +395,8 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  // Refresh cell temperature + OCV every 3 s. The temperature
+  // feeds both the dashboard and eis.h's compensation.
   static unsigned long lastTemp = 0;
   if (millis() - lastTemp > 3000) {
     lastTemp = millis();
@@ -525,7 +409,8 @@ void loop() {
   if (Serial.available()) {
     char ch = Serial.read();
     if (ch == 'c') runCalibration();
-    if (ch == 's') runSweep();
+    if (ch == 's') { runSweep(); printSweepSerial(); }
     if (ch == 'd') runDcirTest();
+    if (ch == 'p') printSweepSerial();
   }
 }
