@@ -35,6 +35,29 @@ Most student BMS projects stop at voltage and temperature. CellSight goes to the
 
 Dark web dashboard served by the ESP32: SOH gauge with grade, OCV, R_ohmic, R_ct, DCIR, cell temperature, a live **Nyquist plot canvas**, the full spectrum table, buttons to run a sweep / calibration / DCIR test, and a **Download CSV** export of the last sweep.
 
+## 📚 Required libraries
+
+Board support (once): **esp32 by Espressif Systems** — Arduino IDE → Boards Manager.
+
+| Library | Used for | Install (Library Manager search) |
+| --- | --- | --- |
+| OneWire (Paul Stoffregen) | DS18B20 1-Wire temperature bus | `OneWire` |
+| DallasTemperature (Miles Burton) | DS18B20 temperature readings | `DallasTemperature` |
+
+Built into the ESP32 core, no install needed: `WiFi`, `WebServer`, `Wire`. The AD5933 driver is written in this repo (`ad5933.h`) — no external AD5933 library is required.
+
+## 🔌 Wiring — pin connections (ESP32)
+
+| ESP32 pin | Connects to | Notes |
+| --- | --- | --- |
+| GPIO21 (SDA) | AD5933 SDA | I2C bus — AD5933 fixed address `0x0D` |
+| GPIO22 (SCL) | AD5933 SCL | I2C clock |
+| AD5933 VOUT / VIN | Cell under test, via the analog front-end (AFE) | ±10 mV AC perturbation around rest potential — never connect the AD5933 directly across a raw cell |
+| GPIO4 | DS18B20 data (DQ) | Add a 4.7 kΩ pull-up to 3.3 V |
+| GPIO26 | DCIR load-pulse MOSFET gate | Switches the known load resistor across the cell for the DC-pulse test |
+| GPIO34 | Cell voltage divider output | ADC input — cell OCV sensing |
+| GND | AFE / sensor ground | Common ground throughout |
+
 ## ⚠️ Safety
 
 Li-ion cells store serious energy. The EIS front-end must isolate and limit the perturbation current; the load-pulse test uses a properly rated resistor and MOSFET. Never short a cell, never exceed its voltage limits, and supervise all tests.
